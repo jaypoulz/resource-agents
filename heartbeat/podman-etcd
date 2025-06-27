@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/usr/bin/sh
 #
 # The podman etcd HA resource agent creates and launches a etcd podman
 # container based off a supplied podman image. Containers managed by
@@ -341,11 +341,14 @@ attribute_node_ip()
 	local attribute="node_ip"
 	local value
 
+        ocf_log info "Looking up node IP"
 	if ! value=$(ip -brief addr show "$OCF_RESKEY_nic" | awk '{gsub("/.*", "", $3); print $3}'); then
 		rc=$?
 		ocf_log err "could not get node ip, error code: $rc"
 		return "$rc"
 	fi
+
+        ocf_log info "Found node ip: '$value'"
 
 	case "$action" in
 		get)
@@ -410,6 +413,7 @@ prepare_env() {
 		for node in $(echo "$OCF_RESKEY_node_ip_map" | sed "s/\s//g;s/;/ /g"); do
 			name=$(echo "$node" | awk -F":" '{print $1}')
 			ip=$(echo "$node" | awk -F":" '{print $2}')
+	                ocf_log info "parsing node IP from map: found '$name:$ip'"
 			if [ -z "$name" ] || [ -z "$ip" ]; then
 				ocf_exit_reason "name or ip missing for 1 or more nodes"
 				exit $OCF_ERR_CONFIGURED
@@ -816,10 +820,12 @@ get_endpoint_status_json()
 }
 
 get_member_list_json() {
+	ocf_log info "Entered the endpoint checker"
 	# Get the list of members visible to the current node
 	local this_node_endpoint
-
 	this_node_endpoint="https://$(attribute_node_ip get):2379"
+	ocf_log info "member list endpoint: '$this_node_endpoint'"
+
 	podman exec "${CONTAINER}" etcdctl member list --endpoints="$this_node_endpoint" -w json
 }
 
@@ -835,7 +841,7 @@ check_peers()
 
 	member_list_json=$(get_member_list_json)
 	rc=$?
-	ocf_log debug "member list: $member_list_json"
+	ocf_log info "member list: '$member_list_json'"
 	if [ $rc -ne 0 ]; then
 		ocf_log info "podman failed to get member list, error code: $rc"
 
@@ -873,12 +879,18 @@ check_peers()
 	#       "https://<node IP>:2379"
 	#   ]
 	# }
-	for node in $(echo "$OCF_RESKEY_node_ip_map" | sed "s/\s//g;s/;/ /g"); do
+
+        ocf_log info "Scanning node IP map: '$OCF_RESKEY_node_ip_map'"
+	for node in $(echo "$OCF_RESKEY_node_ip_map" | sed "s/^\"//;s/\"$//;s/\s//g;s/;/ /g"); do
+                ocf_log info "Found node '$node'"
 		name=$(echo "$node" | awk -F":" '{print $1}')
 		# do not check itself
 		if [ "$name" = "$NODENAME" ]; then
+                        ocf_log info "Skipping node named '$name'"
 			continue
 		fi
+
+                ocf_log info "Node named '$1' does not match '$NODENAME'"
 
 		# Check by IP instead of Name since "learner" members appear only in peerURLs, not by Name.
 		ip=$(echo "$node" | awk -F":" '{print $2}')
@@ -1057,6 +1069,14 @@ run_new_container()
 
 compare_revision()
 {
+
+        members=$(member_count)
+        ocf_log info "comparing revisions between '$members' members"
+        if [ "$members" -eq 1 ]; then
+              echo "equal"
+              return
+        fi
+
 	# Compare local revision (from disk) against peer revision (from CIB).
 	# returns "older", "equal" or "newer"
 	local revision
@@ -1091,11 +1111,12 @@ ensure_pod_manifest_exists()
 	local poll_retries=$((wait_timeout_sec/poll_interval_sec))
 
 	for try in $(seq "$poll_retries"); do
+		ocf_log info "Checking for pod manifest at ($OCF_RESKEY_pod_manifest)"
 		if [ -f "$OCF_RESKEY_pod_manifest" ]; then
 			ocf_log info "pod manifest ($OCF_RESKEY_pod_manifest) found"
 			break
 		fi
-		ocf_log debug "pod manifest ($OCF_RESKEY_pod_manifest) does not exist yet: retry in $poll_interval_sec seconds."
+		ocf_log info "pod manifest ($OCF_RESKEY_pod_manifest) does not exist yet: retry in $poll_interval_sec seconds."
 		sleep "$poll_interval_sec"
 	done
 
@@ -1125,6 +1146,7 @@ podman_start()
 	ocf_log info "ensure etcd pod is not running (retries: $etcd_pod_poll_retries, interval: $etcd_pod_poll_interval_sec)"
 	for try in $(seq $etcd_pod_poll_retries); do
 		if ! etcd_pod_container_exists; then
+		        ocf_log info "etcd pod not running"
 			break
 		fi
 		ocf_log info "etcd pod running: retry in $etcd_pod_poll_interval_sec seconds."
@@ -1136,10 +1158,12 @@ podman_start()
 		return $OCF_ERR_GENERIC
 	fi
 
+	ocf_log info "Checking pod manifest file"
 	if ! ensure_pod_manifest_exists; then
 		ocf_exit_reason "could not find etcd pod manifest ($OCF_RESKEY_pod_manifest)"
 		return "$OCF_ERR_GENERIC"
 	fi
+	ocf_log info "pod_manifest exists at '$OCF_RESKEY_pod_manifest'"
 
 	# force-new-cluster property is a runtime-scoped flag that instructs the agent to force a new cluster-of-1.
 	# Since this attribute is configured with a reboot-lifetime, it is automatically cleared when the machine reboots.
@@ -1151,6 +1175,7 @@ podman_start()
 		if is_force_new_cluster; then
 			ocf_log notice "$NODENAME marked to force-new-cluster"
 		else
+	               	ocf_log info "gather info on local agents"
 			# When the local agent starts, we can infer the cluster state by counting
 			# how many agents are starting or already active:
 			# - 1 active agent: it's the peer (we are just starting)
@@ -1160,6 +1185,7 @@ podman_start()
 			active_resources_count=$(echo "$OCF_RESKEY_CRM_meta_notify_active_resource" | wc -w)
 			case "$active_resources_count" in
 			1)
+	               	        ocf_log info "one active agent found"
 				if [ "$(attribute_learner_node get)" = "$(get_peer_node_name)" ]; then
 					ocf_log info "peer active but in learner mode: start normally"
 				else
@@ -1168,6 +1194,7 @@ podman_start()
 				fi
 				;;
 			0)
+	               	        ocf_log info "no active agents found"
 				# we need to compare the revisions in any of the following branches
 				# so call the function only once here
 				if ! revision_compare_result=$(compare_revision); then
@@ -1375,6 +1402,11 @@ podman_start()
 			if is_force_new_cluster; then
 				clear_force_new_cluster
 
+                                members=$(member_count)
+                                if [ "$members" -eq 1 ]; then
+			            return $OCF_SUCCESS
+                                fi
+
 				local peer_node_name
 				local peer_node_ip
 				peer_node_name="$(get_peer_node_name)"
@@ -1391,6 +1423,22 @@ podman_start()
 		ocf_exit_reason "waiting on monitor_cmd to pass after start"
 		sleep 1
 	done
+}
+
+member_count()
+{
+
+  oldifs=$IFS
+  delimiter=";"
+  IFS="$delimiter"
+
+  # Read the string into an array
+  read -r -a members <<< "$OCF_RESKEY_node_ip_map"
+
+  echo ${#members[@]}
+
+  # Reset IFS to its default value (important for subsequent operations)
+  IFS=$oldifs
 }
 
 podman_stop()
