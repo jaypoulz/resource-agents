@@ -2473,7 +2473,7 @@ podman_start()
 	# This is a SAFETY NET; the member_removal_lock -> fnc_conflict_verdict
 	# departure-aware verdict is the primary fix.
 	if is_force_new_cluster; then
-		local prev_logs prev_container
+		local prev_logs prev_container prev_started
 		# The previous (possibly panicked) container still exists as
 		# ${CONTAINER} (stopped, not yet archived) or was already
 		# archived to ${CONTAINER}-previous by an earlier start cycle.
@@ -2483,9 +2483,31 @@ podman_start()
 			prev_container="${CONTAINER}-previous"
 		fi
 		if [ -n "$prev_container" ]; then
-			prev_logs=$(podman logs --tail 200 "$prev_container" 2>&1 || true)
+			# Bound the scan to the container's most recent start. In the
+			# reuse path (OCF_RESKEY_reuse -> `podman start ${CONTAINER}`)
+			# the same container is restarted in place, so its logs
+			# accumulate across incarnations; an unbounded --tail could
+			# match a panic from an EARLIER start and fire the rescue on a
+			# stale crash. .State.StartedAt.Unix emits an integer Unix
+			# timestamp (avoids RFC3339/Go-String --since format quirks);
+			# if it can't be read we fall back to the unbounded scan.
+			prev_started=$(podman inspect --format '{{.State.StartedAt.Unix}}' "$prev_container" 2>/dev/null)
+			if [ -n "$prev_started" ]; then
+				prev_logs=$(podman logs --since "$prev_started" --tail 200 "$prev_container" 2>&1 || true)
+			else
+				prev_logs=$(podman logs --tail 200 "$prev_container" 2>&1 || true)
+			fi
 			# Require BOTH the raw panic line AND the precursor
 			# "membership: ID removed" error to avoid false triggers.
+			# NOTE: both patterns are literal etcd log strings, so this
+			# rescue is coupled to etcd's wording. If an etcd bump changes
+			# either message this grep silently stops matching and the
+			# rescue no longer fires — the member_removal_lock ->
+			# fnc_conflict_verdict routing above stays the primary fix, so
+			# this degrades to no-safety-net rather than misbehaving.
+			# OCPEDGE-3056 adds a test that fails if an etcd bump breaks
+			# this match, so drift is caught before it ships; update these
+			# strings when that test flags them.
 			if echo "$prev_logs" | grep -qF 'panic: removed all voters' \
 				&& echo "$prev_logs" | grep -qF 'membership: ID removed'; then
 				ocf_log crit "FNC panic rescue: previous container ($prev_container) panicked with 'removed all voters'"
@@ -2793,7 +2815,7 @@ podman_start()
 				break
 			fi
 			if [ "$fnc_guard_wait" -ge 10 ]; then
-				ocf_log err "own force_new_cluster write not visible after ${fnc_guard_wait}s: retrying"
+				ocf_exit_reason "own force_new_cluster write not visible after ${fnc_guard_wait}s: retrying"
 				return "$OCF_ERR_GENERIC"
 			fi
 			sleep 1
@@ -2809,6 +2831,16 @@ podman_start()
 		# learner — its data has no voter entry for itself, so FNC replay
 		# would hit "removed all voters" and panic.  Route to learner-rejoin
 		# or fail-safe instead.
+		#
+		# is_learner reads the learner_node CIB attribute. That attribute is
+		# only trustworthy while a resource agent is up: the monitor keeps it
+		# in sync with the live etcd member list. On a cold boot (no agent
+		# running) it is stale from the previous session, so it is cleared
+		# earlier in this function and is_learner will not fire here. That is
+		# intentional — the cold-boot voterless case is not guarded here but by
+		# the FNC panic rescue in podman_start (which reads the real on-disk
+		# state after the panic) and the member_removal_lock startup routing
+		# (which sends a departed node to learner-rejoin before it reaches FNC).
 		if is_learner; then
 			ocf_log crit "FNC precondition failed: $NODENAME is a learner — force-new-cluster would panic on voterless data; clearing FNC and retrying as learner"
 			clear_force_new_cluster
@@ -3007,8 +3039,32 @@ podman_start()
 						add_member_as_learner "$peer_node_name" "$peer_node_ip"
 						rc=$?
 						if [ $rc -ne 0 ]; then
-							ocf_log err "failed to add peer as learner after force-new-cluster (rc=$rc), returning error to trigger restart"
-							return $OCF_ERR_GENERIC
+							# add_member_as_learner returns OCF_ERR_GENERIC for
+							# two very different failures, so re-check the
+							# container to tell them apart:
+							#
+							#   - Container crashed before/at the learner-add
+							#     (it exited between monitor_cmd_exec above and
+							#     here): we MUST fail so start is retried.
+							#     Otherwise a dead container is reported as
+							#     started and recovery is delayed until the next
+							#     monitor catches it.
+							#
+							#   - Container is still healthy (transient add error
+							#     or stale membership): do NOT fail. Restarting a
+							#     healthy seeded voter can live-lock against a
+							#     peer waiting to be added as a learner. The
+							#     monitor path (check_peer ->
+							#     manage_peer_membership) re-adds an absent peer
+							#     as a learner on the next cycle without a
+							#     restart.
+							podman_simple_status
+							if [ $? -ne $OCF_SUCCESS ]; then
+								ocf_exit_reason "container exited during learner-add after force-new-cluster (rc=$rc); failing start to retry"
+								ocf_run podman logs --tail 20 "${CONTAINER}"
+								return $OCF_ERR_GENERIC
+							fi
+							ocf_log warn "failed to add peer as learner after force-new-cluster (rc=$rc); container is healthy, monitor will retry the learner-add on the next cycle"
 						fi
 					fi
 					clear_force_new_cluster
